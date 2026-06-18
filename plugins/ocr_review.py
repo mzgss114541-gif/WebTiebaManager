@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import time
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Literal
 
@@ -60,7 +62,64 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 DOWNLOAD_TIMEOUT = 15
 OCR_TIMEOUT = 30
-MAX_IMAGES = 10                  # per post, during auto-check
+MAX_IMAGES = 10
+MAX_CACHE_ENTRIES = 500           # auto-prune threshold
+
+ALLOWED_IMAGE_HOSTS = {
+    "tiebapic.baidu.com",
+    "imgsrc.baidu.com",
+    "hiphotos.baidu.com",
+    "gss0.baidu.com",
+    "gss0.bdstatic.com",
+    "gss1.bdstatic.com",
+    "gss2.bdstatic.com",
+    "gss3.bdstatic.com",
+}
+
+BLOCKED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("240.0.0.0/4"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("ff00::/8"),
+]
+
+
+def _is_internal_host(hostname: str) -> bool:
+    if hostname in ("localhost", "0.0.0.0", "::1"):
+        return True
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return any(addr in net for net in BLOCKED_NETWORKS)
+
+
+def _validate_image_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    if _is_internal_host(host):
+        return False
+    if host not in ALLOWED_IMAGE_HOSTS:
+        if not any(host == h or host.endswith("." + h) for h in ALLOWED_IMAGE_HOSTS):
+            return False
+    return True
 
 # ---------------------------------------------------------------------------
 # Lazy OCR engine
@@ -130,6 +189,9 @@ def _sanitize(msg: str) -> str:
 # ---------------------------------------------------------------------------
 
 async def _download(url: str) -> bytes | None:
+    if not _validate_image_url(url):
+        system_logger.debug(f"[ocr_review] blocked url: {_sanitize(url)}")
+        return None
     try:
         t = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
         async with aiohttp.ClientSession(timeout=t) as s:
@@ -222,10 +284,22 @@ def _load_cache(pid: int) -> ScanResult | None:
         return None
 
 
+def _prune_cache(keep: int = MAX_CACHE_ENTRIES) -> int:
+    files = sorted(RESULTS_DIR.glob("*.json"), key=os.path.getmtime)
+    if len(files) <= keep:
+        return 0
+    removed = 0
+    for f in files[:-keep]:
+        f.unlink()
+        removed += 1
+    return removed
+
+
 def _save_cache(r: ScanResult) -> None:
     _result_path(r.pid).write_text(
         r.model_dump_json(indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    _prune_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +318,8 @@ async def _ocr_post(pid: int, content: Content | None = None) -> str:
         return ""
 
     cfg = _load_config()
+    if not cfg.enabled:
+        return ""
     images = content.images[: cfg.max_images]
 
     engine = await _get_engine()
@@ -344,8 +420,9 @@ button{padding:8px 20px;border:none;border-radius:6px;font-size:14px;font-weight
 .btn-suc{background:var(--suc);color:#fff}.btn-suc:hover{opacity:.85}
 .btn-out{background:#fff;color:var(--t1);border:1px solid var(--bd)}.btn-out:hover{border-color:var(--pri);color:var(--pri)}
 .btn-sm{padding:4px 12px;font-size:12px}
-.tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;margin:2px}
-.ti{background:#ecf5ff;color:var(--pri)}.td{background:#fef0f0;color:var(--dng)}.ts{background:#f0f9eb;color:var(--suc)}.tw{background:#fdf6ec;color:var(--war)}
+.btn-sm{padding:4px 12px;font-size:12px}
+.tag-inline{display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;margin:2px}
+.tag-info{background:#ecf5ff;color:var(--pri)}.tag-dng{background:#fef0f0;color:var(--dng)}.tag-suc{background:#f0f9eb;color:var(--suc)}.tag-war{background:#fdf6ec;color:var(--war)}
 .flex{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
 .mt8{margin-top:8px}.mt12{margin-top:12px}.mt16{margin-top:16px}
 .result{border-bottom:1px solid var(--bd);padding:16px 0}.result:last-child{border-bottom:none}
@@ -378,7 +455,11 @@ pre.ocr-text{background:#f8f9fa;padding:12px;border-radius:6px;font-size:13px;wh
   <h2>设置</h2>
   <div class="row">
     <div><label>每帖最多 OCR 图片数</label><input id="maximg" type="number" min="1" max="50" value="10" style="width:100px"></div>
+    <div style="display:flex;align-items:flex-end;padding-bottom:1px"><label><input type="checkbox" id="enabled" checked> 启用 OCR</label></div>
     <div><label>&nbsp;</label><button class="btn-suc" id="btn-save" onclick="saveConfig()">保存</button></div>
+  </div>
+  <div class="mt8">
+    <button class="btn-dng btn-sm" id="btn-clear" onclick="clearCache()">清除所有缓存</button>
   </div>
 </div>
 
@@ -392,12 +473,11 @@ pre.ocr-text{background:#f8f9fa;padding:12px;border-radius:6px;font-size:13px;wh
 var B="/api/plugin/ocr-review";
 function toast(m,c){var e=document.getElementById("toast");e.textContent=m;e.className="toast "+c;setTimeout(function(){e.className="toast"},3000)}
 function api(m,p,b){var o={method:m,headers:{}};if(b){o.headers["Content-Type"]="application/json";o.body=JSON.stringify(b)}return fetch(B+p,o).then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.detail||r.statusText);return d})})}
-function loadConfig(){api("GET","/config").then(function(d){document.getElementById("maximg").value=d.data.max_images}).catch(function(e){toast(e.message,"err")})}
-function saveConfig(){var b=document.getElementById("btn-save");b.disabled=true;b.textContent="保存中...";var mx=parseInt(document.getElementById("maximg").value)||10;api("PUT","/config",{max_images:mx}).then(function(){toast("已保存","ok")}).catch(function(e){toast(e.message,"err")}).finally(function(){b.disabled=false;b.textContent="保存"})}
-function doScan(){var p=document.getElementById("pid").value.trim();if(!p)return toast("请输入PID","err");var b=document.getElementById("btn-scan"),s=document.getElementById("status");b.disabled=true;b.textContent="扫描中...";s.innerHTML='<span class="spin"></span>扫描 PID '+p+' ...';api("POST","/scan/"+p+"?force=true").then(function(d){var r=d.data;s.innerHTML='<span class="tag ts">完成</span> PID:'+r.pid+' TID:'+r.tid+' '+r.forum_name+' &mdash; '+r.ocr_images+'/'+r.total_images+' 张已OCR，共 '+r.ocr_text.length+' 字';loadResults()}).catch(function(e){s.innerHTML='<span class="tag td">失败: '+e.message+'</span>'}).finally(function(){b.disabled=false;b.textContent="扫描"})}
-function loadResults(){var e=document.getElementById("results");api("GET","/list").then(function(d){if(!d.data.length){e.innerHTML='<div class="empty">暂无记录（规则触发或手动扫描后会出现）</div>';return}var h="";d.data.forEach(function(r){var dt=new Date(r.scan_time*1000).toLocaleString("zh-CN");var src=r.trigger=="manual"?"手动":"自动";h+='<div class="result"><div class="flex"><span><span class="tag ti">PID '+r.pid+'</span> <span class="tag tw">'+r.ocr_images+'/'+r.total_images+' 张OCR</span> <span class="tag '+(src=="自动"?"ts":"tw")+'">'+src+'</span></span><span style="font-size:12px;color:#909399">'+dt+'</span></div><div style="font-size:12px;color:#606266;margin-top:4px">TID:'+r.tid+' | '+r.forum_name+' | 共 '+r.ocr_text.length+' 字 | <a href="https://tieba.baidu.com/p/'+r.tid+'" target="_blank" style="color:#409eff">打开帖子</a></div>';
-r.images.forEach(function(img){h+='<div style="margin-top:8px;border:1px solid #ebeef5;border-radius:6px;overflow:hidden"><div style="background:#f8f9fa;padding:6px 12px;font-size:12px;color:#909399;display:flex;justify-content:space-between"><span>'+img.width+'x'+img.height+' | '+img.text_length+'字</span><span style="word-break:break-all;max-width:70%">'+img.url+'</span></div><pre class="ocr-text" style="margin:0;border:none;border-radius:0;max-height:120px">'+img.text+'</pre></div>'});
-h+='</div>'});e.innerHTML=h}).catch(function(err){e.innerHTML='<div class="empty">加载失败: '+err.message+'</div>'})}
+function loadConfig(){api("GET","/config").then(function(d){document.getElementById("maximg").value=d.data.max_images;document.getElementById("enabled").checked=d.data.enabled}).catch(function(e){toast(e.message,"err")})}
+function saveConfig(){var b=document.getElementById("btn-save");b.disabled=true;b.textContent="保存中...";var mx=parseInt(document.getElementById("maximg").value)||10;var en=document.getElementById("enabled").checked;api("PUT","/config",{max_images:mx,enabled:en}).then(function(){toast("已保存","ok")}).catch(function(e){toast(e.message,"err")}).finally(function(){b.disabled=false;b.textContent="保存"})}
+function doScan(){var p=document.getElementById("pid").value.trim();if(!p)return toast("请输入PID","err");var b=document.getElementById("btn-scan"),s=document.getElementById("status");b.disabled=true;b.textContent="扫描中...";s.textContent="";var sp=document.createElement("span");sp.className="spin";s.appendChild(sp);s.appendChild(document.createTextNode(" 扫描 PID "+esc(p)+" ..."));api("POST","/scan/"+p+"?force=true").then(function(d){var r=d.data;s.innerHTML="";var ok=document.createElement("span");ok.className="tag-inline tag-suc";ok.textContent="完成";s.appendChild(ok);s.appendChild(document.createTextNode(" PID:"+r.pid+" TID:"+r.tid+" "+esc(r.forum_name)+" - "+r.ocr_images+"/"+r.total_images+" 张已OCR，共 "+r.ocr_text.length+" 字"));loadResults()}).catch(function(e){s.innerHTML="";var er=document.createElement("span");er.className="tag-inline tag-dng";er.textContent="失败";s.appendChild(er);s.appendChild(document.createTextNode(" "+esc(e.message)))}).finally(function(){b.disabled=false;b.textContent="扫描"})}
+function esc(s){if(typeof s!=="string")return"";return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;")}
+function loadResults(){var e=document.getElementById("results");api("GET","/list").then(function(d){if(!d.data.length){e.innerHTML='<div class="empty">暂无记录（规则触发或手动扫描后会出现）</div>';return}var f=document.createDocumentFragment();d.data.forEach(function(r){var dt=new Date(r.scan_time*1000).toLocaleString("zh-CN");var src=r.trigger=="manual"?"手动":"自动";var sc=r.trigger=="manual"?"tag-war":"tag-suc";var div=document.createElement("div");div.className="result";var flex=document.createElement("div");flex.className="flex";var ls=document.createElement("span");var pt=document.createElement("span");pt.className="tag-inline tag-info";pt.textContent="PID "+r.pid;ls.appendChild(pt);ls.appendChild(document.createTextNode(" "));var ot=document.createElement("span");ot.className="tag-inline tag-war";ot.textContent=r.ocr_images+"/"+r.total_images+" OCR";ls.appendChild(ot);ls.appendChild(document.createTextNode(" "));var st=document.createElement("span");st.className="tag-inline "+sc;st.textContent=src;ls.appendChild(st);flex.appendChild(ls);var ds=document.createElement("span");ds.style.cssText="font-size:12px;color:#909399";ds.textContent=dt;flex.appendChild(ds);div.appendChild(flex);var meta=document.createElement("div");meta.style.cssText="font-size:12px;color:#606266;margin-top:4px";meta.textContent="TID:"+r.tid+" | "+esc(r.forum_name)+" | 共 "+r.ocr_text.length+" 字";div.appendChild(meta);var ld=document.createElement("div");ld.style.cssText="margin-top:2px";var a=document.createElement("a");a.href="https://tieba.baidu.com/p/"+r.tid;a.target="_blank";a.style.cssText="font-size:12px;color:#409eff;text-decoration:none";a.textContent="打开帖子";ld.appendChild(a);div.appendChild(ld);(r.images||[]).forEach(function(img){var det=document.createElement("div");det.style.cssText="margin-top:8px;border:1px solid #ebeef5;border-radius:6px;overflow:hidden";var hdr=document.createElement("div");hdr.style.cssText="background:#f8f9fa;padding:6px 12px;font-size:12px;color:#909399;display:flex;justify-content:space-between";var ds2=document.createElement("span");ds2.textContent=img.width+"x"+img.height+" | "+img.text_length+"字";hdr.appendChild(ds2);var us=document.createElement("span");us.style.cssText="word-break:break-all;max-width:70%";us.textContent=img.url;hdr.appendChild(us);det.appendChild(hdr);var pre=document.createElement("pre");pre.className="ocr-text";pre.style.cssText="margin:0;border:none;border-radius:0;max-height:120px";pre.textContent=img.text;det.appendChild(pre);div.appendChild(det)});f.appendChild(div)});e.innerHTML="";e.appendChild(f)}).catch(function(err){e.innerHTML='<div class="empty">加载失败</div>'})}function clearCache(){if(!confirm("确定清除所有 OCR 缓存？此操作不可恢复。"))return;var b=document.getElementById("btn-clear");b.disabled=true;b.textContent="清除中...";api("POST","/cache/clear").then(function(){toast("缓存已清除","ok");loadResults()}).catch(function(e){toast(e.message,"err")}).finally(function(){b.disabled=false;b.textContent="清除所有缓存"})}
 loadConfig();loadResults();
 </script>
 </body>
@@ -458,6 +538,16 @@ async def update_config(req: OCRConfig) -> BaseResponse[OCRConfig]:
     _save_config(req)
     system_logger.info(f"[ocr_review] config: max_images={req.max_images}")
     return BaseResponse(data=req, message="saved")
+
+
+@router.post("/cache/clear")
+async def clear_cache() -> BaseResponse[int]:
+    count = 0
+    for f in RESULTS_DIR.glob("*.json"):
+        f.unlink()
+        count += 1
+    system_logger.info(f"[ocr_review] cache cleared: {count} files")
+    return BaseResponse(data=count, message=f"Deleted {count} cache files")
 
 
 app.include_router(router)
