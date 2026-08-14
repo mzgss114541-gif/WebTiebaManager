@@ -10,7 +10,7 @@ DEBUG = "--debug" in sys.argv
 PUBLIC = "--public" in sys.argv
 DEV_WEBUI = "--dev-webui" in sys.argv
 
-MAIN_SERVER = os.getenv("WTM_MAIN_SERVER", "https://webtm.tbw.icu")
+MAIN_SERVER = os.getenv("WTM_MAIN_SERVER", "https://webtm.tiebameow.top")
 WEBUI_SERVER = os.getenv("WTM_WEBUI_SERVER", None)
 DEFAULT_SERVER_PORT = 36799
 TRUSTED_PROXIES = os.getenv("WTM_TRUSTED_PROXIES", "127.0.0.1").split(",")
