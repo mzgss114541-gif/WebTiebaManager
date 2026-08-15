@@ -190,6 +190,12 @@ class ProcessContextData(ProcessData):
     conditions: list[ConditionContext]
 
 
+def dedupe_rule_conditions(rules: list[RuleContext]) -> list[RuleContext]:
+    """Deduplicate per-rule condition indices for the detail view, so identical
+    conditions (e.g. multiple keywords of the same type) are rendered only once."""
+    return [rule.model_copy(update={"conditions": list(dict.fromkeys(rule.conditions))}) for rule in rules]
+
+
 async def query_process_context(pid: int, user: current_user_depends):
     async with Database.get_session() as session:
         result = await session.execute(
@@ -218,7 +224,7 @@ async def get_process_detail(pid: int, user: current_user_depends) -> BaseRespon
             is_whitelist=data[0].is_whitelist or False,
             process_time=int(data[0].process_time.timestamp()),
             content=content or make_unknown_content(pid, data[0].tid),
-            rules=data[1].rules,
+            rules=dedupe_rule_conditions(data[1].rules),
             conditions=data[1].conditions,
         )
     )
@@ -273,7 +279,7 @@ async def reprocess_content(user: current_user_depends, request: ReprocessReques
                 is_whitelist=context[0].is_whitelist or False,
                 process_time=int(context[0].process_time.timestamp()),
                 content=None,
-                rules=context[1].rules,
+                rules=dedupe_rule_conditions(context[1].rules),
                 conditions=context[1].conditions,
             )
             if context
