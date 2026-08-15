@@ -48,7 +48,7 @@ from src.utils.logging import system_logger
 # Paths
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = BASE_DIR / "cache" / "plugins" / "ocr_review"
+CACHE_DIR = BASE_DIR / "plugin_data" / "ocr_review"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 CONFIG_FILE = CACHE_DIR / "config.json"
@@ -355,7 +355,8 @@ async def _ocr_post(pid: int, content: Content | None = None) -> str:
         scan_time=time.time(), total_images=total, ocr_images=n_ocr,
         ocr_text=full_text, images=details, trigger="",
     )
-    _save_cache(result)
+    if total:
+        _save_cache(result)
 
     system_logger.info(
         f"[ocr_review] auto-ocr pid={pid} tid={content.tid} "
