@@ -192,8 +192,33 @@ class ProcessContextData(ProcessData):
 
 def dedupe_rule_conditions(rules: list[RuleContext]) -> list[RuleContext]:
     """Deduplicate per-rule condition indices for the detail view, so identical
-    conditions (e.g. multiple keywords of the same type) are rendered only once."""
-    return [rule.model_copy(update={"conditions": list(dict.fromkeys(rule.conditions))}) for rule in rules]
+    conditions (e.g. multiple keywords of the same type) are rendered only once.
+
+    step_status is remapped through the same deduplication so step positions
+    still refer to the deduplicated conditions list.
+    """
+
+    def _remap(status, pos_of):
+        if isinstance(status, int):
+            return pos_of[status] if status < len(pos_of) else status
+        if isinstance(status, list):
+            return [sorted({pos_of[i] for i in group if i < len(pos_of)}) for group in status]
+        return status
+
+    result = []
+    for rule in rules:
+        conds = rule.conditions
+        deduped = list(dict.fromkeys(conds))
+        pos_of = [deduped.index(i) for i in conds]
+        result.append(
+            rule.model_copy(
+                update={
+                    "conditions": deduped,
+                    "step_status": _remap(rule.step_status, pos_of),
+                }
+            )
+        )
+    return result
 
 
 async def query_process_context(pid: int, user: current_user_depends):
